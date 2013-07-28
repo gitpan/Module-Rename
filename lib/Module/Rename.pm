@@ -5,11 +5,13 @@ package Module::Rename;
 use strict;
 use warnings;
 use File::Find;
+use File::Basename;
+use File::Spec qw( splitdir );
 use Sysadm::Install qw(:all);
 use Log::Log4perl qw(:easy);
-use File::Basename;
+use File::Spec::Functions qw( abs2rel splitdir );
 
-our $VERSION = "0.03";
+our $VERSION = "0.04";
 
 ###########################################
 sub new {
@@ -22,8 +24,17 @@ sub new {
         dir_exclude        => ['blib'],
         dir_ignore         => ['CVS'],
         wipe_empty_subdirs => 0,
+        use_git            => 0,
         %options,
     };
+
+    if( $self->{use_git} ) {
+        $self->{ git_bin } = bin_find( "git" );
+        if( !defined $self->{ git_bin } ) {
+            die "No git executable found";
+        }
+        push @{ $self->{dir_exclude} }, ".git";
+    }
 
     $self->{dir_exclude_hash} = { map { $_ => 1 } @{$self->{dir_exclude}} };
     $self->{dir_ignore_hash}  = { map { $_ => 1 } @{$self->{dir_ignore}} };
@@ -38,6 +49,49 @@ sub new {
      $self->{new_pmfile} .= ".pm";
 
     bless $self, $class;
+}
+
+###########################################
+sub longest_common_path {
+###########################################
+    my( $self, $file1, $file2 ) = @_;
+
+    my @common = ();
+
+    my @dirs1 = splitdir( dirname $file1 );
+    my @dirs2 = splitdir( dirname $file2 );
+
+    for my $dir1_part ( @dirs1 ) {
+        my $dir2_part = shift @dirs2;
+        if( $dir1_part eq $dir2_part ) {
+            push @common, $dir1_part;
+        } else {
+            last;
+        }
+    }
+
+    return File::Spec->catfile( @common );
+}
+
+###########################################
+sub move {
+###########################################
+    my($self, $old_path, $new_path) = @_;
+
+    if( $old_path ne $new_path ) {
+        if ($self->{use_git} and !-d $old_path) {
+              # make sure we launch the git command inside the git workspace
+            my $common = $self->longest_common_path( $old_path, $new_path );
+            cd $common;
+            tap("git", "mv", 
+               abs2rel( $old_path, $common ),
+               abs2rel( $new_path, $common ),
+            );
+            cdback;
+        } else {
+            mv $old_path, $new_path;
+        }
+    }
 }
 
 ###########################################
@@ -79,7 +133,7 @@ sub find_and_rename {
         INFO "mv $file $newfile";
         my $dir = dirname($newfile);
         mkd $dir unless -d $dir;
-        mv $file, $newfile;
+        $self->move($file, $newfile);
     }
 
     (my $dashed_look_for   = $self->{name_old}) =~ s#::#-#g;
@@ -94,7 +148,7 @@ sub find_and_rename {
     }, $start_dir);
     for my $item (@rename_candidates) {
         (my $newitem = $item) =~ s/$dashed_look_for/$dashed_replace_by/;
-        mv $item, $newitem;
+        $self->move($item, $newitem);
     }
 
         # Even the start_dir could have to be modified.
@@ -104,16 +158,25 @@ sub find_and_rename {
     %empty_subdirs = map { s/$dashed_look_for/$dashed_replace_by/; $_; }
         %empty_subdirs;
 
-    my @dirs = ();
-        # Delete all empty dirs
-    finddepth(sub { 
-        if(-d and $self->dir_empty($_) and
-           ! exists $empty_subdirs{$File::Find::name}) {
-            WARN "$File::Find::name is empty and can go away";
-            rmf $_ if $self->{wipe_empty_subdirs};
-            $File::Find::prune = 1;
+    if( $self->{wipe_empty_subdirs} ) {
+        my @dirs = ();
+            # Delete all empty dirs
+        find(sub { 
+            if( exists $self->{dir_exclude_hash}->{$_} ) {
+                $File::Find::prune = 1;
+            }
+
+            if(-d and $self->dir_empty($_) and
+               ! exists $empty_subdirs{$File::Find::name}
+            ) {
+                WARN "$File::Find::name is empty and can go away";
+                push @dirs, $File::Find::name;
+            }
+        }, $start_dir);
+        for my $dir ( @dirs ) {
+            rmf $dir;
         }
-    }, $start_dir);
+    }
 }
 
 ###########################################
